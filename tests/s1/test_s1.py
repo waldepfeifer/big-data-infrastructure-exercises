@@ -16,6 +16,18 @@ class TestS1Student:
         with client as client:
             response = client.post("/api/s1/aircraft/download?file_limit=1")
             assert True
+        with client as client:
+            response = client.get("/api/s1/aircraft?num_results=5&page=1")
+            assert not response.is_error, "Error at the aircraft endpoint with pagination"
+            r = response.json()
+            assert isinstance(r, list), "Result is not a list"
+            assert len(r) <= 5, "Pagination did not work correctly"
+        with client as client:
+            response = client.post("/api/s1/aircraft/download?file_limit=10")
+            assert response.status_code == 200, "Failed to download with file_limit=10"
+        with client as client:
+            response = client.post("/api/s1/aircraft/prepare")
+            assert response.status_code == 200, "Prepare endpoint failed"
 
 
 class TestItCanBeEvaluated:
