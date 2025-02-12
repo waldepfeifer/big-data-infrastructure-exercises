@@ -1,11 +1,14 @@
 import json
 import os
 import shutil
+import time
 from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timedelta
+from pathlib import Path
 from typing import Annotated
 
 import requests
-from fastapi import APIRouter, status
+from fastapi import APIRouter, HTTPException, status
 from fastapi.params import Query
 
 from bdi_api.settings import Settings
@@ -54,7 +57,8 @@ def download_data(
 
     TIP: always clean the download folder before writing again to avoid having old files.
     """
-    download_dir = os.path.join(settings.raw_dir, "day=20231101")
+    base_date = datetime(2023, 11, 1, 0, 0, 0)
+    download_dir = Path(settings.raw_dir) / "day=20231101"
     base_url = settings.source_url + "/2023/11/01/"
 
     # Clean the download directory
@@ -62,31 +66,30 @@ def download_data(
         shutil.rmtree(download_dir) #Delete directory
     os.makedirs(download_dir, exist_ok=True) #Create directory
 
-    i = 0
-    p = 0
-    while i < file_limit:
-        file_name = "Z.json.gz"
-        file_url = f"{base_url}{p:06d}{file_name}"  # Construct file url
-        local_file_path = os.path.join(download_dir, f"{p:06d}{file_name}")  # Construct file path
-        i += 1
-        p += 5
+    # Sequential download logic based on 5-second intervals for time format "%H%M%SZ.json.gz"
+    interval_seconds = 5
+    max_retries = 3
 
-        try:
-            # First check if the file exists using a HEAD request (fast)
-            requests.head(file_url, timeout=2)
+    for i in range(file_limit):
+        seconds_offset = i * interval_seconds
+        file_time = (base_date + timedelta(seconds=seconds_offset)).strftime("%H%M%SZ.json.gz")
+        file_url = base_url + file_time
+        target_path = download_dir / Path(file_time)
 
-            # File exists, perform GET request to download the file
-            response = requests.get(file_url, timeout=2)
-            response.raise_for_status()
-
-            # Write file locally
-            with open(local_file_path, "w") as file:
-                file.write(response.text)
-                print(f"Download successful {file_url}")
-
-        except requests.RequestException as e:
-            file_limit = file_limit +1
-            print(f"Failed to download {file_url}. Error: {str(e)}")  # Log failure with error message
+        for attempt in range(max_retries):
+            try:
+                response = requests.get(file_url, timeout=10)
+                response.raise_for_status()
+                with target_path.open("wb") as file:
+                    file.write(response.content)
+                print(f"Downloaded: {file_time}")
+                break
+            except requests.RequestException as e:
+                print(f"Attempt {attempt + 1} failed to download {file_time}: {e}")
+                if attempt < max_retries - 1:
+                    time.sleep(2 ** attempt)  # Exponential backoff
+                else:
+                    print(f"Skipping {file_time} after {max_retries} attempts.")
 
     return "OK"
 
@@ -117,22 +120,42 @@ def prepare_data() -> str:
         shutil.rmtree(prepared_dir)
     os.makedirs(prepared_dir, exist_ok=True)
 
-    all_data = []
+    file_paths = [
+        os.path.join(raw_dir, file_name)
+        for file_name in os.listdir(raw_dir)
+        if os.path.isfile(os.path.join(raw_dir, file_name))
+    ]
 
-    # Use ThreadPoolExecutor to process files in parallel
-    file_paths = [os.path.join(raw_dir, file_name) for file_name in os.listdir(raw_dir)]
+    def process_file(file_path):
+        try:
+            with open(file_path) as file:
+                file_data = json.load(file)
+                timestamp = datetime.fromtimestamp(file_data.get("now", 0)).isoformat()
+                return [
+                    {
+                    "icao": aircraft_data.get("hex", None),
+                    "registration": aircraft_data.get("r", None),
+                    "type": aircraft_data.get("t", None),
+                    "lat": aircraft_data.get("lat", None),
+                    "lon": aircraft_data.get("lon", None),
+                    "alt_baro": aircraft_data.get("alt_baro", None),
+                    "timestamp": timestamp,
+                    "ground_speed": aircraft_data.get("gs", None),
+                    "emergency": aircraft_data.get("emergency", None),
+                    }
+                    for aircraft_data in file_data.get("aircraft", [])
+                ]
+        except (json.JSONDecodeError, FileNotFoundError):
+            return []
+
+    # Process files in parallel and flatten the results
     with ThreadPoolExecutor() as executor:
-        results = executor.map(
-            lambda file_path: json.load(open(file_path)).get("aircraft", [])
-            if os.path.isfile(file_path) else [],
-            file_paths
-        )
-        for aircraft_data in results:
-            all_data.extend(aircraft_data)
+        all_data = [entry for result in executor.map(process_file, file_paths) for entry in result]
 
     prepared_file_path = os.path.join(prepared_dir, "aircraft_data.json")
     with open(prepared_file_path, "w") as prepared_file:
         json.dump(all_data, prepared_file, indent=4)
+
     return "OK"
 
 
@@ -148,9 +171,9 @@ def list_aircraft(num_results: int = 100, page: int = 0) -> list[dict]:
 
     # Extract relevant fields and filter out entries without required fields
     filtered_data = [
-        {"icao": record.get("hex"), "registration": record.get("r"), "type": record.get("t")}
+        {"icao": record.get("icao"), "registration": record.get("registration"), "type": record.get("type")}
         for record in data
-        if record.get("hex") and record.get("r") and record.get("t")
+        if record.get("icao") and record.get("registration") and record.get("type")
     ]
 
     # Remove duplicates by creating a dictionary keyed by `icao`
@@ -176,11 +199,19 @@ def get_aircraft_position(icao: str, num_results: int = 1000, page: int = 0) -> 
     with open(prepared_file_path) as file:
         data = json.load(file)
 
-    # Filter records by `hex` field, which corresponds to `icao`
-    aircraft_positions = [
-        {"timestamp": record["seen"], "lat": record["lat"], "lon": record["lon"]}
-        for record in data if record.get("hex") == icao
-    ]
+    # Filter records by ICAO
+    try:
+        aircraft_positions = [
+            {"timestamp": record["timestamp"], "lat": record["lat"], "lon": record["lon"]}
+            for record in data if record.get("icao") == icao
+        ]
+
+        # If no positions are found, raise 404
+        if not aircraft_positions:
+            raise ValueError
+
+    except ValueError:
+        raise HTTPException(status_code=404, detail="Aircraft not found") from None
 
     # Sort positions by timestamp
     sorted_positions = sorted(aircraft_positions, key=lambda x: x["timestamp"])
@@ -203,11 +234,16 @@ def get_aircraft_statistics(icao: str) -> dict:
     with open(prepared_file_path) as file:
         data = json.load(file)
 
-    # Filter by `hex` instead of `icao`
-    aircraft_data = [record for record in data if record.get("hex") == icao]
+    # Try to get aircraft data
+    try:
+        aircraft_data = [record for record in data if record.get("icao") == icao]
 
-    if not aircraft_data:
-        return {"max_altitude_baro": 0, "max_ground_speed": 0, "had_emergency": False}
+        # If no data is found, raise 404
+        if not aircraft_data:
+            raise ValueError
+
+    except ValueError:
+        raise HTTPException(status_code=404, detail="Aircraft not found") from None
 
     # Compute statistics
     max_altitude_baro = max(
@@ -215,7 +251,7 @@ def get_aircraft_statistics(icao: str) -> dict:
          else 0 for record in aircraft_data), default=0
     )
     max_ground_speed = max(
-        (float(record.get("gs", 0)) if isinstance(record.get("gs", 0), (int, float))
+        (float(record.get("ground_speed", 0)) if isinstance(record.get("ground_speed", 0), (int, float))
          else 0 for record in aircraft_data), default=0
     )
     had_emergency = any(record.get("emergency", False) for record in aircraft_data)
@@ -223,5 +259,5 @@ def get_aircraft_statistics(icao: str) -> dict:
     return {
         "max_altitude_baro": max_altitude_baro,
         "max_ground_speed": max_ground_speed,
-        "had_emergency": had_emergency,
+        "had_emergency": had_emergency
     }
