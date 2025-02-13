@@ -1,3 +1,4 @@
+import csv
 import os
 import orjson
 import shutil
@@ -123,16 +124,22 @@ def prepare_data() -> str:
                     for aircraft_data in file_data.get("aircraft", [])
                 ]
         except (orjson.JSONDecodeError, FileNotFoundError):
-            print(f"{file_path} could not been processed")
             return []
 
     # Process files in parallel and flatten the results
     with ThreadPoolExecutor() as executor:
         all_data = [entry for result in executor.map(process_file, file_paths) for entry in result]
 
-    prepared_file_path = os.path.join(prepared_dir, "aircraft_data.json")
-    with open(prepared_file_path, "wb") as prepared_file:
-        prepared_file.write(orjson.dumps(all_data, option=orjson.OPT_INDENT_2))
+    # Define CSV file path
+    prepared_file_path = os.path.join(prepared_dir, "aircraft_data.csv")
+
+    # Write to CSV file
+    with open(prepared_file_path, mode="w", newline="") as csv_file:
+        fieldnames = ["icao", "registration", "type", "lat", "lon", "alt_baro", "timestamp", "ground_speed", "emergency"]
+        writer = csv.DictWriter(csv_file, fieldnames=fieldnames)
+        writer.writeheader()
+        for row in all_data:
+            writer.writerow(row)
 
     return "OK"
 
@@ -142,10 +149,11 @@ def list_aircraft(num_results: int = 100, page: int = 0) -> list[dict]:
     """List all the available aircraft, its registration and type ordered by
     icao asc
     """
-    prepared_file_path = os.path.join(settings.prepared_dir, "day=20231101", "aircraft_data.json")
+    prepared_file_path = os.path.join(settings.prepared_dir, "day=20231101", "aircraft_data.csv")
 
-    with open(prepared_file_path) as file:
-        data = orjson.loads(file.read())
+    with open(prepared_file_path, newline="") as file:
+        reader = csv.DictReader(file)
+        data = list(reader)
 
     # Extract relevant fields and filter out entries without required fields
     filtered_data = [
@@ -172,10 +180,11 @@ def get_aircraft_position(icao: str, num_results: int = 1000, page: int = 0) -> 
     """Returns all the known positions of an aircraft ordered by time (asc)
     If an aircraft is not found, return an empty list.
     """
-    prepared_file_path = os.path.join(settings.prepared_dir, "day=20231101", "aircraft_data.json")
+    prepared_file_path = os.path.join(settings.prepared_dir, "day=20231101", "aircraft_data.csv")
 
-    with open(prepared_file_path) as file:
-        data = orjson.loads(file.read())
+    with open(prepared_file_path, newline="") as file:
+        reader = csv.DictReader(file)
+        data = list(reader)
 
     # Filter records by ICAO
     try:
@@ -207,10 +216,11 @@ def get_aircraft_statistics(icao: str) -> dict:
     * max_ground_speed
     * had_emergency
     """
-    prepared_file_path = os.path.join(settings.prepared_dir, "day=20231101", "aircraft_data.json")
+    prepared_file_path = os.path.join(settings.prepared_dir, "day=20231101", "aircraft_data.csv")
 
-    with open(prepared_file_path) as file:
-        data = orjson.loads(file.read())
+    with open(prepared_file_path, newline="") as file:
+        reader = csv.DictReader(file)
+        data = list(reader)
 
     # Try to get aircraft data
     try:
@@ -223,14 +233,21 @@ def get_aircraft_statistics(icao: str) -> dict:
     except ValueError:
         raise HTTPException(status_code=404, detail="Aircraft not found") from None
 
+    # Function to safely convert to float, returning 0 if it fails
+    def safe_float(value):
+        try:
+            return float(value)
+        except (ValueError, TypeError):
+            return 0
+
     # Compute statistics
     max_altitude_baro = max(
-        (float(record.get("alt_baro", 0)) if isinstance(record.get("alt_baro", 0), (int, float))
-         else 0 for record in aircraft_data), default=0
+        (safe_float(record.get("alt_baro", 0)) for record in aircraft_data),
+        default=0
     )
     max_ground_speed = max(
-        (float(record.get("ground_speed", 0)) if isinstance(record.get("ground_speed", 0), (int, float))
-         else 0 for record in aircraft_data), default=0
+        (safe_float(record.get("ground_speed", 0)) for record in aircraft_data),
+        default=0
     )
     had_emergency = any(record.get("emergency", False) for record in aircraft_data)
 
