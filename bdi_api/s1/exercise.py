@@ -16,7 +16,6 @@ from bdi_api.settings import Settings
 settings = Settings()
 
 
-
 s1 = APIRouter(
     responses={
         status.HTTP_404_NOT_FOUND: {"description": "Not found"},
@@ -62,7 +61,7 @@ def download_data(
         seconds_offset = i * interval_seconds
         file_time = (base_date + timedelta(seconds=seconds_offset)).strftime("%H%M%SZ.json.gz")
         file_url = base_url + file_time
-        target_path = download_dir / Path(file_time)
+        target_path = download_dir / Path(file_time[:-3])
 
         for attempt in range(max_retries):
             try:
