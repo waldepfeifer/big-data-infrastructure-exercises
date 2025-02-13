@@ -1,5 +1,5 @@
-import json
 import os
+import orjson
 import shutil
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -106,7 +106,7 @@ def prepare_data() -> str:
     def process_file(file_path):
         try:
             with open(file_path) as file:
-                file_data = json.load(file)
+                file_data = orjson.loads(file.read())
                 timestamp = datetime.fromtimestamp(file_data.get("now", 0)).isoformat()
                 return [
                     {
@@ -122,7 +122,8 @@ def prepare_data() -> str:
                     }
                     for aircraft_data in file_data.get("aircraft", [])
                 ]
-        except (json.JSONDecodeError, FileNotFoundError):
+        except (orjson.JSONDecodeError, FileNotFoundError):
+            print(f"{file_path} could not been processed")
             return []
 
     # Process files in parallel and flatten the results
@@ -130,8 +131,8 @@ def prepare_data() -> str:
         all_data = [entry for result in executor.map(process_file, file_paths) for entry in result]
 
     prepared_file_path = os.path.join(prepared_dir, "aircraft_data.json")
-    with open(prepared_file_path, "w") as prepared_file:
-        json.dump(all_data, prepared_file, indent=4)
+    with open(prepared_file_path, "wb") as prepared_file:
+        prepared_file.write(orjson.dumps(all_data, option=orjson.OPT_INDENT_2))
 
     return "OK"
 
@@ -144,7 +145,7 @@ def list_aircraft(num_results: int = 100, page: int = 0) -> list[dict]:
     prepared_file_path = os.path.join(settings.prepared_dir, "day=20231101", "aircraft_data.json")
 
     with open(prepared_file_path) as file:
-        data = json.load(file)
+        data = orjson.loads(file.read())
 
     # Extract relevant fields and filter out entries without required fields
     filtered_data = [
@@ -174,7 +175,7 @@ def get_aircraft_position(icao: str, num_results: int = 1000, page: int = 0) -> 
     prepared_file_path = os.path.join(settings.prepared_dir, "day=20231101", "aircraft_data.json")
 
     with open(prepared_file_path) as file:
-        data = json.load(file)
+        data = orjson.loads(file.read())
 
     # Filter records by ICAO
     try:
@@ -209,7 +210,7 @@ def get_aircraft_statistics(icao: str) -> dict:
     prepared_file_path = os.path.join(settings.prepared_dir, "day=20231101", "aircraft_data.json")
 
     with open(prepared_file_path) as file:
-        data = json.load(file)
+        data = orjson.loads(file.read())
 
     # Try to get aircraft data
     try:
