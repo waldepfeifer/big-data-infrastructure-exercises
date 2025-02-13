@@ -2,14 +2,6 @@ from fastapi.testclient import TestClient
 
 
 class TestS1Student:
-    """
-    As you code it's always important to ensure that your code reflects
-    the business requisites you have.
-    The optimal way to do so is via tests.
-    Use this class to create functions to test your application.
-
-    For more information on the library used, search `pytest` in your preferred search engine.
-    """
 
     def test_first(self, client: TestClient) -> None:
         # Implement tests if you want

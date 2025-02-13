@@ -34,10 +34,7 @@ def download_data(
         Query(
             ...,
             description="""
-    Limits the number of files to download.
-    You must always start from the first the page returns and
-    go in ascending order in order to correctly obtain the results.
-    I'll test with increasing number of files starting from 100.""",
+    Limits the number of files to download. The default is 100.""",
         ),
     ] = 100,
 ) -> str:
@@ -47,15 +44,6 @@ def download_data(
     documentation: https://www.adsbexchange.com/version-2-api-wip/
         See "Trace File Fields" section
 
-    Think about the way you organize the information inside the folder
-    and the level of preprocessing you might need.
-
-    To manipulate the data use any library you feel comfortable with.
-    Just make sure to configure it in the `pyproject.toml` file
-    so it can be installed using `poetry update`.
-
-
-    TIP: always clean the download folder before writing again to avoid having old files.
     """
     base_date = datetime(2023, 11, 1, 0, 0, 0)
     download_dir = Path(settings.raw_dir) / "day=20231101"
@@ -102,16 +90,6 @@ def prepare_data() -> str:
     * documentation: https://www.adsbexchange.com/version-2-api-wip/
         See "Trace File Fields" section
 
-    Think about the way you organize the information inside the folder
-    and the level of preprocessing you might need.
-
-    To manipulate the data use any library you feel comfortable with.
-    Just make sure to configure it in the `pyproject.toml` file
-    so it can be installed using `poetry update`.
-
-    TIP: always clean the prepared folder before writing again to avoid having old files.
-
-    Keep in mind that we are downloading a lot of small files, and some libraries might not work well with this!
     """
     raw_dir = os.path.join(settings.raw_dir, "day=20231101")
     prepared_dir = os.path.join(settings.prepared_dir, "day=20231101")
