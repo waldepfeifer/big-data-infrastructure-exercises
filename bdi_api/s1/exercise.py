@@ -1,6 +1,5 @@
 import csv
 import os
-import orjson
 import shutil
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -8,6 +7,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Annotated
 
+import orjson
 import requests
 from fastapi import APIRouter, HTTPException, status
 from fastapi.params import Query
