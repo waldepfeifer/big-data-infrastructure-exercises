@@ -1,11 +1,14 @@
+import csv
 import os
 import shutil
 import time
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Annotated
 
 import boto3
+import orjson
 import requests
 from fastapi import APIRouter, status
 from fastapi.params import Query
@@ -13,6 +16,7 @@ from fastapi.params import Query
 from bdi_api.settings import Settings
 
 settings = Settings()
+
 
 base_url = settings.source_url + "/2023/11/01/"
 s3_bucket = settings.s3_bucket
@@ -68,8 +72,9 @@ def download_data(
 
     for i in range(file_limit):
         seconds_offset = i * interval_seconds
-        file_time = (base_date + timedelta(seconds=seconds_offset)).strftime("%H%M%SZ.json.gz")
-        file_url = base_url + file_time
+        file_time_gz = (base_date + timedelta(seconds=seconds_offset)).strftime("%H%M%SZ.json.gz")
+        file_time = file_time_gz[:-3]  # Remove .gz extension
+        file_url = base_url + file_time_gz
         local_file_path = local_download_dir / Path(file_time)
 
         for attempt in range(max_retries):
@@ -92,10 +97,72 @@ def download_data(
 
 @s4.post("/aircraft/prepare")
 def prepare_data() -> str:
-    """Obtain the data from AWS s3 and store it in the local `prepared` directory
-    as done in s2.
+    """Obtain the data from AWS s3 and store it in the local `prepared` directory."""
+    prepared_dir = os.path.join(settings.prepared_dir, "day=20231101")
 
-    All the `/api/s1/aircraft/` endpoints should work as usual
-    """
-    # TODO
+    # Clean up prepared directory if it exists
+    if os.path.exists(prepared_dir):
+        shutil.rmtree(prepared_dir)
+    os.makedirs(prepared_dir, exist_ok=True)
+
+    s3_client = boto3.client("s3")
+
+    # List all objects in the S3 raw directory for the specified day
+    objects = []
+    paginator = s3_client.get_paginator("list_objects_v2")
+    for page in paginator.paginate(Bucket=s3_bucket, Prefix=s3_prefix_path):
+        objects.extend(page.get("Contents", []))
+    # Filter for JSON files
+    s3_keys = [obj["Key"] for obj in objects if obj["Key"].endswith(".json")]
+
+    def process_file(s3_key):
+        try:
+            response = s3_client.get_object(Bucket=s3_bucket, Key=s3_key)
+            file_content = response["Body"].read()
+            file_data = orjson.loads(file_content)
+            # Extract a timestamp based on the "now" field
+            timestamp = datetime.fromtimestamp(file_data.get("now", 0)).isoformat()
+            return [
+                {
+                    "icao": aircraft_data.get("hex"),
+                    "registration": aircraft_data.get("r"),
+                    "type": aircraft_data.get("t"),
+                    "lat": aircraft_data.get("lat"),
+                    "lon": aircraft_data.get("lon"),
+                    "alt_baro": aircraft_data.get("alt_baro"),
+                    "timestamp": timestamp,
+                    "ground_speed": aircraft_data.get("gs"),
+                    "emergency": aircraft_data.get("emergency"),
+                }
+                for aircraft_data in file_data.get("aircraft", [])
+            ]
+        except Exception as e:
+            print(f"Error processing {s3_key}: {e}")
+            return []
+
+    # Process files in parallel and flatten the list of results
+    all_data = []
+    with ThreadPoolExecutor() as executor:
+        for result in executor.map(process_file, s3_keys):
+            all_data.extend(result)
+
+    # Write the consolidated data to CSV in the prepared directory
+    prepared_file_path = os.path.join(prepared_dir, "aircraft_data.csv")
+    with open(prepared_file_path, mode="w", newline="") as csv_file:
+        fieldnames = [
+            "icao",
+            "registration",
+            "type",
+            "lat",
+            "lon",
+            "alt_baro",
+            "timestamp",
+            "ground_speed",
+            "emergency",
+        ]
+        writer = csv.DictWriter(csv_file, fieldnames=fieldnames)
+        writer.writeheader()
+        for row in all_data:
+            writer.writerow(row)
+
     return "OK"
