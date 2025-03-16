@@ -122,20 +122,29 @@ def prepare_data() -> str:
             file_data = orjson.loads(file_content)
             # Extract a timestamp based on the "now" field
             timestamp = datetime.fromtimestamp(file_data.get("now", 0)).isoformat()
-            return [
-                {
+            processed_data = []
+
+            for aircraft_data in file_data.get("aircraft", []):
+                # Process alt_baro: if not numeric, set to None
+                alt_baro_raw = aircraft_data.get("alt_baro")
+                try:
+                    alt_baro_val = int(alt_baro_raw)
+                except (ValueError, TypeError):
+                    alt_baro_val = None
+
+                processed_data.append({
                     "icao": aircraft_data.get("hex"),
                     "registration": aircraft_data.get("r"),
                     "type": aircraft_data.get("t"),
                     "lat": aircraft_data.get("lat"),
                     "lon": aircraft_data.get("lon"),
-                    "alt_baro": aircraft_data.get("alt_baro"),
+                    "alt_baro": alt_baro_val,
                     "timestamp": timestamp,
                     "ground_speed": aircraft_data.get("gs"),
                     "emergency": aircraft_data.get("emergency"),
-                }
-                for aircraft_data in file_data.get("aircraft", [])
-            ]
+                })
+
+            return processed_data
         except Exception as e:
             print(f"Error processing {s3_key}: {e}")
             return []
