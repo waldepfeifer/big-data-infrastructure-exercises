@@ -346,7 +346,13 @@ def get_aircraft_statistics(icao: str) -> dict:
                 SELECT
                     COALESCE(MAX(alt_baro), 0) AS max_altitude_baro,
                     COALESCE(MAX(ground_speed), 0) AS max_ground_speed,
-                    MAX(CASE WHEN emergency IS NOT NULL AND emergency <> '' THEN 1 ELSE 0 END) AS had_emergency
+                    MAX(
+                        CASE
+                            WHEN emergency IS NOT NULL AND emergency <> '' AND emergency <> 'none'
+                            THEN 1
+                            ELSE 0
+                        END
+                    ) AS had_emergency
                 FROM aircraft_data
                 WHERE icao = %s;
             """
