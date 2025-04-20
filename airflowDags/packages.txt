@@ -1,0 +1,25 @@
+# System packages required for the project
+
+# Database and networking
+postgresql-client
+libpq-dev
+
+# Compression and file handling
+gzip
+unzip
+
+# Python development
+python3-dev
+build-essential
+
+# AWS CLI and tools
+awscli
+
+# Additional utilities
+curl
+wget
+git
+
+# Required for some Python packages
+libffi-dev
+libssl-dev

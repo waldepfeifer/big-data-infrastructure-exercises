@@ -1,0 +1,11 @@
+environment:
+  - AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID}
+  - AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY}
+  - AWS_DEFAULT_REGION=${AWS_DEFAULT_REGION}
+  - S3_BUCKET=${S3_BUCKET}
+  - SOURCE_URL=${SOURCE_URL}
+
+services:
+  airflow-webserver:
+    image: airflow-webserver
+    ports:
