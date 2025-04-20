@@ -11,10 +11,11 @@ from starlette.responses import JSONResponse
 import bdi_api
 from bdi_api.examples import v0_router
 
-# from bdi_api.s1.exercise import s1
+
 from bdi_api.s1.exercise import s1
 from bdi_api.s4.exercise import s4
 from bdi_api.s7.exercise import s7
+from bdi_api.s8.exercise import s8
 from bdi_api.settings import Settings
 
 logger = logging.getLogger("uvicorn.error")
@@ -67,6 +68,7 @@ app.include_router(v0_router)
 app.include_router(s1)
 app.include_router(s4)
 app.include_router(s7)
+app.include_router(s8)
 
 @app.get("/health", status_code=200)
 async def get_health() -> JSONResponse:
