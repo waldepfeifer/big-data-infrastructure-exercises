@@ -1,0 +1,8 @@
+# Database Configuration
+db_password = "your-secure-password-here"  # Replace with your actual secure password
+
+# AWS Configuration
+region = "us-east-1"  # AWS region to deploy resources
+
+# Environment Configuration
+environment = "production"  # Environment name (production/staging/development) 
