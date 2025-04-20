@@ -30,11 +30,19 @@ from urllib3.util.retry import Retry
 load_dotenv()
 
 # Configuration
-MAX_FILES = 100
-MAX_WORKERS = min(32, cpu_count() * 4)
-CHUNK_SIZE = 64 * 1024
-BATCH_SIZE = 1000
+MAX_FILES = 100  # Reduced to prevent overwhelming S3
+MAX_WORKERS = min(8, cpu_count())  # Match M3 core count
+CHUNK_SIZE = 512 * 1024  # Increased to 512KB for better throughput
+BATCH_SIZE = 250  # Reduced to prevent S3 throttling
 PARQUET_COMPRESSION = 'SNAPPY'
+
+# S3 Configuration
+S3_MAX_RETRIES = 3  # Reduced retries to fail faster
+S3_BACKOFF_FACTOR = 2.0  # More aggressive backoff
+S3_TIMEOUT = 60  # Increased timeout for larger files
+S3_CONNECT_TIMEOUT = 15  # Increased connect timeout
+S3_READ_TIMEOUT = 60  # Increased read timeout
+S3_MAX_POOL_CONNECTIONS = 10  # Reduced to prevent connection pool exhaustion
 
 # Database settings
 MIN_CONNECTIONS, MAX_CONNECTIONS = 5, 20
