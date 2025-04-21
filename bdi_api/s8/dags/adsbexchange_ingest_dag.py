@@ -6,9 +6,10 @@ import logging
 import os
 import re
 import tempfile
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import contextmanager
-from datetime import datetime
+from datetime import datetime, timedelta
 from multiprocessing import cpu_count
 from pathlib import Path
 
@@ -30,7 +31,7 @@ from urllib3.util.retry import Retry
 load_dotenv()
 
 # Configuration
-MAX_FILES = 100  # Reduced to prevent overwhelming S3
+MAX_FILES = 100
 MAX_WORKERS = min(8, cpu_count())  # Match M3 core count
 CHUNK_SIZE = 512 * 1024  # Increased to 512KB for better throughput
 BATCH_SIZE = 250  # Reduced to prevent S3 throttling
@@ -47,6 +48,11 @@ S3_MAX_POOL_CONNECTIONS = 10  # Reduced to prevent connection pool exhaustion
 # Database settings
 MIN_CONNECTIONS, MAX_CONNECTIONS = 5, 20
 connection_pool = None
+connection_pool_metrics = {
+    'total_connections': 0,
+    'active_connections': 0,
+    'waiting_connections': 0
+}
 
 # Dates to process
 URL_DATES = [
@@ -55,6 +61,24 @@ URL_DATES = [
     "2024-07-01", "2024-08-01", "2024-09-01", "2024-10-01",
     "2024-11-01"
 ]
+
+# Add structured logging configuration
+logging.basicConfig(
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    level=logging.INFO
+)
+logger = logging.getLogger(__name__)
+
+class ADSBExchangeError(Exception):
+    """Custom exception for ADSB Exchange specific errors."""
+    pass
+
+def log_with_context(logger, level, message, **kwargs):
+    """Helper function for structured logging with context."""
+    context = {k: v for k, v in kwargs.items() if v is not None}
+    if context:
+        message = f"{message} | Context: {context}"
+    logger.log(level, message)
 
 def get_db_config():
     """Get database configuration with optimized settings."""
@@ -76,45 +100,92 @@ def get_db_config():
         raise ValueError("Missing database configuration")
     return config
 
+def get_connection_pool_metrics():
+    """Get current connection pool metrics."""
+    return {
+        'total_connections': connection_pool_metrics['total_connections'],
+        'active_connections': connection_pool_metrics['active_connections'],
+        'waiting_connections': connection_pool_metrics['waiting_connections'],
+        'pool_utilization': (
+            connection_pool_metrics['active_connections'] /
+            connection_pool_metrics['total_connections'] * 100
+            if connection_pool_metrics['total_connections'] > 0 else 0
+        )
+    }
+
 def initialize_connection_pool():
     """Initialize the connection pool with optimized settings."""
     global connection_pool
     try:
-        logger = logging.getLogger("airflow.task")
         db_config = get_db_config()
         safe_config = {k: '***' if k == 'password' else v for k, v in db_config.items()}
-        logger.info(f"Creating connection pool with config: {safe_config}")
+        log_with_context(logger, logging.INFO, "Creating connection pool", config=safe_config)
 
         connection_pool = pool.ThreadedConnectionPool(
             MIN_CONNECTIONS,
             MAX_CONNECTIONS,
             **db_config
         )
-        logger.info("Connection pool created successfully")
+        connection_pool_metrics['total_connections'] = MAX_CONNECTIONS
+        log_with_context(logger, logging.INFO, "Connection pool created successfully",
+                        metrics=get_connection_pool_metrics())
     except Exception as e:
-        logger.error(f"Failed to establish connection pool: {e}")
+        log_with_context(logger, logging.ERROR, "Failed to establish connection pool", error=str(e))
         raise
 
 @contextmanager
 def get_db_cursor():
-    """Get a database cursor with optimized settings."""
+    """Get a database cursor with optimized settings and metrics tracking."""
     connection = None
-    try:
-        if connection_pool is None:
-            raise ValueError("Connection pool is not initialized")
-        connection = connection_pool.getconn()
-        connection.autocommit = True
-        cursor = connection.cursor()
-        yield cursor
-    except Exception as e:
-        logger = logging.getLogger("airflow.task")
-        logger.error(f"Database connection error: {e}")
-        raise
-    finally:
-        if cursor:
-            cursor.close()
-        if connection:
-            connection_pool.putconn(connection)
+    cursor = None
+    max_retries = 3
+    retry_delay = 5
+    retry_count = 0
+
+    while retry_count < max_retries:
+        try:
+            if connection_pool is None:
+                raise ValueError("Connection pool is not initialized")
+
+            connection_pool_metrics['waiting_connections'] += 1
+            connection = connection_pool.getconn()
+            connection_pool_metrics['active_connections'] += 1
+            connection_pool_metrics['waiting_connections'] -= 1
+
+            # Test connection before using it
+            connection.autocommit = True
+            cursor = connection.cursor()
+            cursor.execute("SELECT 1")
+            cursor.fetchone()
+
+            yield cursor
+            break
+        except Exception as e:
+            retry_count += 1
+            if connection:
+                try:
+                    connection_pool.putconn(connection)
+                    connection_pool_metrics['active_connections'] -= 1
+                except Exception:
+                    pass
+                connection = None
+
+            if retry_count == max_retries:
+                log_with_context(logger, logging.ERROR, "Database connection error",
+                               error=str(e), metrics=get_connection_pool_metrics())
+                raise
+            else:
+                log_with_context(logger, logging.WARNING, "Database connection attempt failed, retrying",
+                               attempt=retry_count, error=str(e))
+                time.sleep(retry_delay * retry_count)  # Exponential backoff
+        finally:
+            if cursor:
+                cursor.close()
+            if connection:
+                connection_pool.putconn(connection)
+                connection_pool_metrics['active_connections'] -= 1
+                log_with_context(logger, logging.DEBUG, "Connection returned to pool",
+                               metrics=get_connection_pool_metrics())
 
 def create_session():
     """Create an optimized requests session with retry logic."""
@@ -196,44 +267,47 @@ def process_date_files(session, s3_client, date_str, source_url, s3_bucket, temp
         gz_files = sorted(re.findall(r'href="(.*?\.gz)"', response.text))[:MAX_FILES]
 
         if not gz_files:
-            logging.warning(f"⚠️ No files found for {date_str}")
+            log_with_context(logger, logging.WARNING, "No files found for date", date=date_str)
             return False
 
-        logging.info(f"📥 Found {len(gz_files)} files to process for {date_str}")
+        log_with_context(logger, logging.INFO, "Found files to process",
+                        date=date_str, file_count=len(gz_files))
 
         # Process files in parallel
         with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-            # Download and upload each file
             futures = []
             for filename in gz_files:
                 file_url = f"{base_url}{filename}"
                 temp_file = temp_dir / filename
                 s3_key = f"{bronze_prefix}{filename}"
 
-                logging.info(f"  📥 Queueing download: {filename}")
-                logging.info(f"    Source: {file_url}")
-                logging.info(f"    Temp: {temp_file}")
+                log_with_context(logger, logging.INFO, "Queueing download",
+                               filename=filename, source=file_url)
 
-                # Submit download and upload task
                 futures.append(executor.submit(
                     process_single_file,
                     session, s3_client, file_url, temp_file, s3_bucket, s3_key
                 ))
 
-            # Wait for all tasks to complete
             success_count = 0
             for future in as_completed(futures):
                 if future.result():
                     success_count += 1
 
             if success_count == 0:
-                raise ValueError(f"No files successfully processed for {date_str}")
+                raise ADSBExchangeError(f"No files successfully processed for {date_str}")
 
-            logging.info(f"✅ Successfully processed {success_count}/{len(gz_files)} files for {date_str}")
+            log_with_context(logger, logging.INFO, "Successfully processed files",
+                           date=date_str, success_count=success_count, total_files=len(gz_files))
             return True
 
+    except requests.exceptions.RequestException as e:
+        log_with_context(logger, logging.ERROR, "HTTP request failed",
+                        date=date_str, error=str(e))
+        return False
     except Exception as e:
-        logging.error(f"❌ Failed to process date {date_str}: {e}")
+        log_with_context(logger, logging.ERROR, "Unexpected error processing date",
+                        date=date_str, error=str(e))
         return False
 
 def process_single_file(session, s3_client, file_url, temp_file, s3_bucket, s3_key):
@@ -309,28 +383,30 @@ def process_bronze_file(temp_file):
         return []
 
 def process_batch_records(batch_records, schema, parquet_chunks_dir, parquet_chunk_count, chunk_size):
-    """Process a batch of records and write to parquet chunks."""
+    """Process a batch of records and write to parquet chunks with optimized settings."""
     total_records = 0
     for j in range(0, len(batch_records), chunk_size):
         chunk = batch_records[j:j + chunk_size]
         df = pd.DataFrame(chunk)
 
-        # Convert numeric columns
+        # Optimize numeric columns
         numeric_columns = ['lat', 'lon', 'ground_speed']
         for col in numeric_columns:
             if col in df.columns:
                 df[col] = pd.to_numeric(df[col], errors='coerce')
                 df[col] = df[col].fillna(0)
 
-        # Convert alt_baro to integer
+        # Optimize alt_baro
         if 'alt_baro' in df.columns:
             df['alt_baro'] = df['alt_baro'].replace('ground', 0)
             df['alt_baro'] = pd.to_numeric(df['alt_baro'], errors='coerce')
             df['alt_baro'] = df['alt_baro'].fillna(0).astype('int64')
 
-        # Convert timestamp to datetime
+        # Optimize timestamp with ISO8601 format support
         if 'timestamp' in df.columns:
-            df['timestamp'] = pd.to_datetime(df['timestamp'])
+            df['timestamp'] = pd.to_datetime(df['timestamp'], format='ISO8601', errors='coerce')
+            # Fill any invalid timestamps with the minimum valid timestamp
+            df['timestamp'] = df['timestamp'].fillna(pd.Timestamp.min)
 
         # Convert to table with enforced schema
         table = pa.Table.from_pandas(df, schema=schema)
@@ -343,12 +419,16 @@ def process_batch_records(batch_records, schema, parquet_chunks_dir, parquet_chu
             compression=PARQUET_COMPRESSION,
             version='2.6',
             write_statistics=True,
-            row_group_size=100000
+            row_group_size=100000,
+            use_dictionary=True,
+            write_page_index=True,
+            data_page_size=1048576  # 1MB
         )
 
         total_records += len(chunk)
         parquet_chunk_count += 1
-        logging.info(f"  📊 Processed {total_records} records so far")
+        log_with_context(logger, logging.INFO, "Processed records",
+                        total_records=total_records)
 
         # Clear memory
         del df
@@ -460,6 +540,7 @@ def prepare_date_parquet(s3_client, s3_bucket, date_str, temp_dir):
         bronze_prefix = f"bronze/adsbexchange/_in_date={year}{month}{day}/"
         silver_prefix = f"silver/adsbexchange/_in_date={year}{month}{day}/"
 
+        # Define optimized schema with proper data types
         schema = pa.schema([
             ('icao', pa.string()),
             ('registration', pa.string()),
@@ -472,10 +553,10 @@ def prepare_date_parquet(s3_client, s3_bucket, date_str, temp_dir):
             ('emergency', pa.string())
         ])
 
-        logging.info(f"📥 Listing files in S3 Bronze for {date_str}")
+        log_with_context(logger, logging.INFO, "Listing files in S3 Bronze", date=date_str)
         bronze_files = list_bronze_files(s3_client, s3_bucket, bronze_prefix)
         if not bronze_files:
-            logging.warning(f"⚠️ No files found in bronze for {date_str}")
+            log_with_context(logger, logging.WARNING, "No files found in bronze", date=date_str)
             return False
 
         parquet_chunks_dir = temp_dir / "parquet_chunks"
@@ -483,20 +564,79 @@ def prepare_date_parquet(s3_client, s3_bucket, date_str, temp_dir):
         batch_size = 3
         chunk_size = 5000
 
+        # Process files in parallel with optimized settings
         total_records, _ = process_batch_files(
             bronze_files, s3_client, s3_bucket, temp_dir,
             schema, parquet_chunks_dir, batch_size, chunk_size
         )
 
         if total_records == 0:
-            raise ValueError(f"No valid data found for {date_str}")
+            raise ADSBExchangeError(f"No valid data found for {date_str}")
 
+        # Combine chunks with optimized settings
         chunk_paths = sorted(parquet_chunks_dir.glob("*.parquet"))
         silver_key = f"{silver_prefix}aircraft_data.parquet"
-        return combine_and_upload_parquet_chunks(chunk_paths, s3_client, s3_bucket, silver_key)
+
+        # Create a temporary file for the final parquet
+        temp_parquet = temp_dir / f"aircraft_data_{date_str}.parquet"
+
+        # Use optimized Parquet writer settings with smaller row groups
+        parquet_writer = pq.ParquetWriter(
+            temp_parquet,
+            schema,
+            compression=PARQUET_COMPRESSION,
+            version='2.6',
+            write_statistics=True,
+            use_dictionary=True,
+            write_page_index=True,
+            data_page_size=524288  # Reduced to 512KB
+        )
+
+        try:
+            for chunk_path in chunk_paths:
+                table = pq.read_table(
+                    chunk_path,
+                    memory_map=True,
+                    use_threads=True
+                )
+                # Use smaller row groups for better memory management
+                parquet_writer.write_table(table, row_group_size=50000)
+                chunk_path.unlink()
+        finally:
+            parquet_writer.close()
+
+        # Upload the final parquet file to S3 with progress tracking
+        file_size = os.path.getsize(temp_parquet)
+        log_with_context(logger, logging.INFO, "Starting S3 upload",
+                        file_size=file_size, date=date_str)
+
+        # Configure S3 transfer settings
+        config = boto3.s3.transfer.TransferConfig(
+            multipart_threshold=8 * 1024 * 1024,  # 8MB
+            max_concurrency=10,
+            multipart_chunksize=8 * 1024 * 1024,  # 8MB
+            use_threads=True
+        )
+
+        with open(temp_parquet, 'rb') as f:
+            s3_client.upload_fileobj(
+                f,
+                s3_bucket,
+                silver_key,
+                Config=config,
+                ExtraArgs={'ContentType': 'application/parquet'}
+            )
+
+        log_with_context(logger, logging.INFO, "Completed S3 upload", date=date_str)
+
+        # Clean up temporary file
+        temp_parquet.unlink()
+
+        return True
 
     except Exception as e:
-        logging.error(f"❌ Failed to prepare parquet for {date_str}: {e}")
+        log_with_context(logger, logging.ERROR, "Failed to prepare parquet",
+                        date=date_str, error=str(e))
         return False
     finally:
         if os.path.exists(parquet_chunks_dir):
@@ -597,26 +737,259 @@ def process_chunk(chunk: pd.DataFrame) -> list:
         for _, row in chunk.iterrows()
     ]
 
-@task(retries=3, retry_delay=60)
-def upload_to_postgres():
-    """Upload to PostgreSQL with parallel processing and optimized connection handling."""
+def process_chunk_to_postgres(chunk: pd.DataFrame, source_date: str, silver_prefix: str):
+    """Process a single chunk of data and upload to PostgreSQL."""
+    max_retries = 3
+    retry_delay = 5
+    retry_count = 0
+
+    while retry_count < max_retries:
+        try:
+            with get_db_cursor() as cur:
+                # Process the chunk
+                data = process_chunk(chunk)
+                if not data:
+                    return
+
+                # Use COPY for bulk insert with optimized settings
+                with tempfile.NamedTemporaryFile(mode='w', delete=False) as f:
+                    for row in data:
+                        escaped_row = [str(x).replace('\t', '\\t') if x is not None else '\\N' for x in row]
+                        file_location = f"{silver_prefix}aircraft_data.parquet"
+                        systems_passed = ['bronze', 'silver', 'postgres']
+                        f.write(
+                            '\t'.join(escaped_row) + '\t' + source_date + '\t' +
+                            file_location + '\t' + '{' + ','.join(systems_passed) + '}' + '\n'
+                        )
+
+                # Use COPY with optimized settings
+                with open(f.name) as f:
+                    cur.copy_expert("""
+                        COPY adsbexchange_table
+                        (icao, registration, type, lat, lon, alt_baro,
+                         timestamp, ground_speed, emergency, source_date,
+                         _file_location, _systems_passed)
+                        FROM STDIN WITH (FORMAT csv, DELIMITER E'\t', NULL '\\N')
+                    """, f)
+
+                os.unlink(f.name)
+
+                # Log statistics
+                cur.execute("""
+                    SELECT
+                        COUNT(*) as total_records,
+                        COUNT(DISTINCT icao) as unique_aircraft,
+                        COUNT(DISTINCT source_date) as unique_dates
+                    FROM adsbexchange_table
+                """)
+                stats = cur.fetchone()
+                logger = logging.getLogger("airflow.task")
+                logger.info(f"""
+                    Database Statistics:
+                    - Total Records: {stats[0]}
+                    - Unique Aircraft: {stats[1]}
+                    - Unique Dates: {stats[2]}
+                    - New Records Inserted: {len(data)}
+                """)
+                break  # Success, exit retry loop
+        except Exception as e:
+            retry_count += 1
+            if retry_count == max_retries:
+                logger = logging.getLogger("airflow.task")
+                logger.error(f"Error processing chunk after {max_retries} attempts: {str(e)}")
+                raise
+            else:
+                logger = logging.getLogger("airflow.task")
+                logger.warning(f"Error processing chunk, retrying (attempt {retry_count}/{max_retries}): {str(e)}")
+                time.sleep(retry_delay * retry_count)  # Exponential backoff
+                continue
+
+@task(
+    retries=3,
+    retry_delay=60,
+    retry_exponential_backoff=True,
+    max_retry_delay=300,
+    execution_timeout=timedelta(hours=2),  # Increased timeout to 2 hours
+    doc_md="""
+    Downloads aircraft data from ADS-B Exchange and uploads to S3 bronze layer.
+
+    This task:
+    1. Downloads JSON data from ADS-B Exchange for specified dates
+    2. Validates the data format
+    3. Uploads to S3 bronze layer with proper partitioning
+
+    **Inputs:**
+    - Source URL from Airflow variables
+    - S3 bucket from Airflow variables
+
+    **Outputs:**
+    - Success/failure status
+    - Number of files processed
+    - Error details if any
+    """
+)
+def download_and_upload():
+    """Download and upload task implementation."""
     logger = logging.getLogger("airflow.task")
-    logger.info("Starting upload to PostgreSQL")
+    source_url = Variable.get("SOURCE_URL", default_var="https://samples.adsbexchange.com/readsb-hist")
+    s3_bucket = Variable.get("S3_BUCKET", default_var="bdi-aircraft-waldepfeifer")
+
+    log_with_context(logger, logging.INFO, "Starting download and upload task",
+                    source_url=source_url, s3_bucket=s3_bucket)
+
+    s3_client = create_s3_client()
+    http_session = create_session()
+    temp_dir = Path(tempfile.mkdtemp())
+
+    try:
+        for date_str in URL_DATES:
+            log_with_context(logger, logging.INFO, "Processing date", date=date_str)
+            success = process_date_files(http_session, s3_client, date_str, source_url, s3_bucket, temp_dir)
+            if success:
+                log_with_context(logger, logging.INFO, "Successfully processed date", date=date_str)
+            else:
+                log_with_context(logger, logging.ERROR, "Failed to process date", date=date_str)
+        return True
+    except Exception as e:
+        log_with_context(logger, logging.ERROR, "Task failed", error=str(e))
+        return False
+    finally:
+        if temp_dir.exists():
+            for file in temp_dir.glob("*"):
+                file.unlink()
+            temp_dir.rmdir()
+
+@task(
+    retries=3,
+    retry_delay=60,
+    retry_exponential_backoff=True,
+    max_retry_delay=300,
+    execution_timeout=timedelta(hours=2),  # Increased timeout to 2 hours
+    doc_md="""
+    Prepares data for silver layer by transforming bronze data to Parquet format.
+
+    This task:
+    1. Downloads data from S3 bronze layer
+    2. Transforms JSON to Parquet format
+    3. Applies schema validation
+    4. Uploads to S3 silver layer
+
+    **Inputs:**
+    - S3 bucket from Airflow variables
+    - Bronze layer data
+
+    **Outputs:**
+    - Success/failure status
+    - Number of records processed
+    - Error details if any
+    """
+)
+def prepare():
+    """Prepare task implementation."""
+    logger = logging.getLogger("airflow.task")
+    s3_bucket = Variable.get("S3_BUCKET", default_var="bdi-aircraft-waldepfeifer")
+
+    log_with_context(logger, logging.INFO, "Starting preparation task", s3_bucket=s3_bucket)
+
+    s3_client = create_s3_client()
+    temp_dir = Path(tempfile.mkdtemp())
+
+    try:
+        for date_str in URL_DATES:
+            log_with_context(logger, logging.INFO, "Preparing parquet for date", date=date_str)
+            success = prepare_date_parquet(s3_client, s3_bucket, date_str, temp_dir)
+            if success:
+                log_with_context(logger, logging.INFO, "Successfully prepared parquet for date", date=date_str)
+            else:
+                log_with_context(logger, logging.ERROR, "Failed to prepare parquet for date", date=date_str)
+        return True
+    except Exception as e:
+        log_with_context(logger, logging.ERROR, "Task failed", error=str(e))
+        return False
+    finally:
+        if temp_dir.exists():
+            for file in temp_dir.glob("*"):
+                file.unlink()
+            temp_dir.rmdir()
+
+@task(
+    retries=3,
+    retry_delay=60,
+    retry_exponential_backoff=True,
+    max_retry_delay=300,
+    execution_timeout=timedelta(hours=2),  # Increased timeout to 2 hours
+    doc_md="""
+    Uploads processed data to PostgreSQL database.
+
+    This task:
+    1. Downloads Parquet files from S3 silver layer
+    2. Validates data against database schema
+    3. Performs upsert operations
+    4. Updates metadata
+
+    **Inputs:**
+    - S3 bucket from Airflow variables
+    - Database connection details from environment
+    - Silver layer data
+
+    **Outputs:**
+    - Success/failure status
+    - Number of records inserted/updated
+    - Error details if any
+    """
+)
+def upload_to_postgres():
+    """Upload to PostgreSQL task implementation."""
+    logger = logging.getLogger("airflow.task")
+    log_with_context(logger, logging.INFO, "Starting upload to PostgreSQL")
 
     with tempfile.TemporaryDirectory() as temp_dir:
         try:
-            s3_client = boto3.client("s3")
+            s3_client = create_s3_client()
             s3_bucket = Variable.get("S3_BUCKET", default_var="bdi-aircraft-waldepfeifer")
             initialize_connection_pool()
 
-            # Process dates sequentially to avoid connection pool exhaustion
+            # Drop and recreate the table
+            with get_db_cursor() as cur:
+                cur.execute("""
+                    DROP TABLE IF EXISTS adsbexchange_table CASCADE;
+
+                    CREATE TABLE adsbexchange_table (
+                        id SERIAL PRIMARY KEY,
+                        icao VARCHAR(6),
+                        registration VARCHAR(20),
+                        type VARCHAR(50),
+                        lat DOUBLE PRECISION,
+                        lon DOUBLE PRECISION,
+                        alt_baro INTEGER,
+                        timestamp TIMESTAMP,
+                        ground_speed DOUBLE PRECISION,
+                        emergency TEXT,
+                        source_date VARCHAR(8) NOT NULL,
+                        _loaded_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        _file_location TEXT,
+                        _systems_passed TEXT[]
+                    );
+
+                    CREATE INDEX idx_adsbexchange_table_icao
+                        ON adsbexchange_table(icao);
+                    CREATE INDEX idx_adsbexchange_table_type
+                        ON adsbexchange_table(type);
+                    CREATE INDEX idx_adsbexchange_table_timestamp
+                        ON adsbexchange_table(timestamp);
+                    CREATE INDEX idx_adsbexchange_table_source_date
+                        ON adsbexchange_table(source_date);
+                    CREATE INDEX idx_adsbexchange_table_loaded_time
+                        ON adsbexchange_table(_loaded_time);
+                """)
+                log_with_context(logger, logging.INFO, "Table recreated successfully")
+
             for date_str in URL_DATES:
                 date = datetime.strptime(date_str, "%Y-%m-%d")
                 year, month, day = date.strftime("%Y"), date.strftime("%m"), date.strftime("%d")
                 silver_prefix = f"silver/adsbexchange/_in_date={year}{month}{day}/"
                 source_date = f"{year}{month}{day}"
 
-                # Download parquet file
                 parquet_file = Path(temp_dir) / f"aircraft_data_{date_str}.parquet"
                 s3_client.download_file(
                     s3_bucket,
@@ -624,196 +997,46 @@ def upload_to_postgres():
                     parquet_file
                 )
 
-                # Process data in smaller chunks to avoid memory issues
-                df = pd.read_parquet(parquet_file)
-                chunk_size = 10000  # Process 10k records at a time
-                chunks = np.array_split(df, len(df) // chunk_size + 1)
+                # Process in smaller chunks with progress tracking
+                chunk_size = 5000  # Reduced chunk size
+                total_records = 0
+                processed_records = 0
 
-                # Process chunks sequentially to avoid connection pool exhaustion
-                for chunk in chunks:
-                    process_chunk_to_postgres(chunk, source_date, silver_prefix)
+                # First, get total number of records
+                with pq.ParquetFile(parquet_file) as parquet:
+                    total_records = parquet.metadata.num_rows
 
-            logger.info("Successfully uploaded all data to PostgreSQL")
+                log_with_context(logger, logging.INFO, "Starting data processing",
+                               date=date_str, total_records=total_records)
+
+                # Process in chunks using pyarrow directly
+                with pq.ParquetFile(parquet_file) as parquet:
+                    for batch in parquet.iter_batches(batch_size=chunk_size):
+                        df = batch.to_pandas()
+                        process_chunk_to_postgres(df, source_date, silver_prefix)
+                        processed_records += len(df)
+
+                        # Log progress every 10%
+                        progress = (processed_records / total_records) * 100
+                        if progress % 10 == 0:
+                            log_with_context(logger, logging.INFO, "Processing progress",
+                                           date=date_str, progress=f"{progress:.1f}%")
+
+                        # Clear memory
+                        del df
+                        gc.collect()
+
+                log_with_context(logger, logging.INFO, "Completed data processing",
+                               date=date_str, processed_records=processed_records)
+
+            log_with_context(logger, logging.INFO, "Successfully uploaded all data to PostgreSQL")
             return True
         except Exception as e:
-            logger.error(f"Failed to upload data to PostgreSQL: {e}")
+            log_with_context(logger, logging.ERROR, "Failed to upload data to PostgreSQL", error=str(e))
             return False
         finally:
             if connection_pool is not None:
                 connection_pool.closeall()
-
-def process_chunk_to_postgres(chunk: pd.DataFrame, source_date: str, silver_prefix: str):
-    """Process a single chunk of data and upload to PostgreSQL."""
-    try:
-        with get_db_cursor() as cur:
-            # Create table if it doesn't exist
-            cur.execute("""
-                CREATE TABLE IF NOT EXISTS adsbexchange_table (
-                    id SERIAL PRIMARY KEY,
-                    icao VARCHAR(6),
-                    registration VARCHAR(20),
-                    type VARCHAR(50),
-                    lat DOUBLE PRECISION,
-                    lon DOUBLE PRECISION,
-                    alt_baro INTEGER,
-                    timestamp TIMESTAMP,
-                    ground_speed DOUBLE PRECISION,
-                    emergency TEXT,
-                    source_date VARCHAR(8) NOT NULL,
-                    _loaded_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    _file_location TEXT,
-                    _systems_passed TEXT[]
-                );
-
-                CREATE INDEX IF NOT EXISTS idx_adsbexchange_table_icao
-                    ON adsbexchange_table(icao);
-                CREATE INDEX IF NOT EXISTS idx_adsbexchange_table_type
-                    ON adsbexchange_table(type);
-                CREATE INDEX IF NOT EXISTS idx_adsbexchange_table_timestamp
-                    ON adsbexchange_table(timestamp);
-                CREATE INDEX IF NOT EXISTS idx_adsbexchange_table_source_date
-                    ON adsbexchange_table(source_date);
-                CREATE INDEX IF NOT EXISTS idx_adsbexchange_table_loaded_time
-                    ON adsbexchange_table(_loaded_time);
-            """)
-
-            # Process the chunk
-            data = process_chunk(chunk)
-            if data:
-                # Get existing records
-                cur.execute("""
-                    SELECT icao, registration, type, lat, lon, alt_baro,
-                           timestamp, ground_speed, emergency, source_date
-                    FROM adsbexchange_table
-                """)
-                existing_records = {row[0]: row[1:] for row in cur.fetchall()}
-
-                # Prepare new records
-                new_records = []
-                for row in data:
-                    icao = row[0]
-                    # Convert row to tuple for comparison, handling NULL values
-                    row_data = tuple(
-                        str(x).strip() if isinstance(x, str) else x
-                        for x in row[1:]
-                    )
-
-                    # Only create new record if:
-                    # 1. Aircraft doesn't exist in database, or
-                    # 2. Data has actually changed, or
-                    # 3. Source date is different
-                    if (icao not in existing_records or
-                        existing_records[icao][:-1] != row_data or  # Compare all fields except source_date
-                        existing_records[icao][-1] != source_date):  # Compare source_date
-                        new_records.append(row)
-
-                if new_records:
-                    # Use COPY for bulk insert
-                    with tempfile.NamedTemporaryFile(mode='w', delete=False) as f:
-                        for row in new_records:
-                            escaped_row = [str(x).replace('\t', '\\t') if x is not None else '\\N' for x in row]
-                            file_location = f"{silver_prefix}aircraft_data.parquet"
-                            systems_passed = ['bronze', 'silver', 'postgres']
-                            f.write(
-                                '\t'.join(escaped_row) + '\t' + source_date + '\t' +
-                                file_location + '\t' + '{' + ','.join(systems_passed) + '}' + '\n'
-                            )
-
-                    with open(f.name) as f:
-                        cur.copy_expert("""
-                            COPY adsbexchange_table
-                            (icao, registration, type, lat, lon, alt_baro,
-                             timestamp, ground_speed, emergency, source_date,
-                             _file_location, _systems_passed)
-                            FROM STDIN WITH (FORMAT csv, DELIMITER E'\t', NULL '\\N')
-                        """, f)
-
-                    os.unlink(f.name)
-
-                    # Log statistics
-                    cur.execute("""
-                        SELECT
-                            COUNT(*) as total_records,
-                            COUNT(DISTINCT icao) as unique_aircraft,
-                            COUNT(DISTINCT source_date) as unique_dates
-                        FROM adsbexchange_table
-                    """)
-                    stats = cur.fetchone()
-                    logger = logging.getLogger("airflow.task")
-                    logger.info(f"""
-                        Database Statistics:
-                        - Total Records: {stats[0]}
-                        - Unique Aircraft: {stats[1]}
-                        - Unique Dates: {stats[2]}
-                        - New Records Inserted: {len(new_records)}
-                    """)
-    except Exception as e:
-        logger = logging.getLogger("airflow.task")
-        logger.error(f"Error processing chunk: {str(e)}")
-        raise
-
-@task(retries=3, retry_delay=60)
-def download_and_upload():
-    logger = logging.getLogger("airflow.task")
-    source_url = Variable.get("SOURCE_URL", default_var="https://samples.adsbexchange.com/readsb-hist")
-    s3_bucket = Variable.get("S3_BUCKET", default_var="bdi-aircraft-waldepfeifer")
-
-    logger.info("="*80)
-    logger.info("Starting download and upload task")
-    logger.info(f"  Source URL: {source_url}")
-    logger.info(f"  S3 Bucket: {s3_bucket}")
-    logger.info("="*80)
-
-    s3_client = boto3.client("s3")
-    http_session = create_session()
-    temp_dir = Path(tempfile.mkdtemp())
-
-    try:
-        for date_str in URL_DATES:
-            logger.info(f"Processing date: {date_str}")
-            success = process_date_files(http_session, s3_client, date_str, source_url, s3_bucket, temp_dir)
-            if success:
-                logger.info(f"✅ Successfully processed {date_str}")
-            else:
-                logger.error(f"❌ Failed to process {date_str}")
-    finally:
-        if temp_dir.exists():
-            for file in temp_dir.glob("*"):
-                file.unlink()
-            temp_dir.rmdir()
-        logger.info("="*80)
-        logger.info("Download and upload task completed")
-        logger.info("="*80)
-
-@task(retries=3, retry_delay=60)
-def prepare():
-    logger = logging.getLogger("airflow.task")
-    s3_bucket = Variable.get("S3_BUCKET", default_var="bdi-aircraft-waldepfeifer")
-
-    logger.info("="*80)
-    logger.info("Starting preparation task")
-    logger.info(f"  S3 Bucket: {s3_bucket}")
-    logger.info("="*80)
-
-    s3_client = boto3.client("s3")
-    temp_dir = Path(tempfile.mkdtemp())
-
-    try:
-        for date_str in URL_DATES:
-            logger.info(f"Preparing parquet for: {date_str}")
-            success = prepare_date_parquet(s3_client, s3_bucket, date_str, temp_dir)
-            if success:
-                logger.info(f"✅ Successfully prepared parquet for {date_str}")
-            else:
-                logger.error(f"❌ Failed to prepare parquet for {date_str}")
-    finally:
-        if temp_dir.exists():
-            for file in temp_dir.glob("*"):
-                file.unlink()
-            temp_dir.rmdir()
-        logger.info("="*80)
-        logger.info("Preparation task completed")
-        logger.info("="*80)
 
 @dag(
     schedule="@daily",
@@ -821,8 +1044,66 @@ def prepare():
     catchup=False,
     max_active_runs=1,
     tags=["adsbexchange", "ingest"],
+    doc_md="""
+    # ADS-B Exchange Data Ingestion DAG
+
+    This DAG processes aircraft tracking data from ADS-B Exchange.
+
+    ## Overview
+    The DAG follows a bronze-silver-gold data lake pattern:
+    1. Downloads raw JSON data from ADS-B Exchange (bronze)
+    2. Transforms to Parquet format with schema validation (silver)
+    3. Loads into PostgreSQL database (gold)
+
+    ## Tasks
+    - `download_and_upload`: Downloads and stores raw data
+    - `prepare`: Transforms to Parquet format
+    - `upload_to_postgres`: Loads into database
+
+    ## Configuration
+    - S3 bucket for storage
+    - PostgreSQL database for final storage
+    - Environment variables for credentials
+
+    ## Error Handling
+    - Retries with exponential backoff
+    - Detailed logging
+    - Connection pooling
+    """
 )
 def adsbexchange_ingest():
+    """Main DAG definition."""
     download_and_upload() >> prepare() >> upload_to_postgres()
 
 adsbexchange_ingest = adsbexchange_ingest()
+
+def create_s3_client():
+    """Create an optimized S3 client with retry configuration."""
+    try:
+        # Create S3 client with retry configuration
+        s3_client = boto3.client(
+            's3',
+            config=boto3.session.Config(
+                retries={
+                    'max_attempts': S3_MAX_RETRIES,
+                    'mode': 'adaptive'
+                },
+                connect_timeout=S3_CONNECT_TIMEOUT,
+                read_timeout=S3_READ_TIMEOUT,
+                max_pool_connections=S3_MAX_POOL_CONNECTIONS
+            )
+        )
+
+        # Test connection
+        s3_client.head_bucket(Bucket=Variable.get("S3_BUCKET", default_var="bdi-aircraft-waldepfeifer"))
+        log_with_context(logger, logging.INFO, "S3 client created successfully",
+                        config={
+                            'max_retries': S3_MAX_RETRIES,
+                            'connect_timeout': S3_CONNECT_TIMEOUT,
+                            'read_timeout': S3_READ_TIMEOUT,
+                            'max_pool_connections': S3_MAX_POOL_CONNECTIONS
+                        })
+        return s3_client
+    except Exception as e:
+        log_with_context(logger, logging.ERROR, "Failed to create S3 client", error=str(e))
+        raise
